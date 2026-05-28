@@ -10,14 +10,15 @@ import pgeocode
 
 
 # =========================================================
-# 1. Online data location
+# 1. Online CSV data location
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent / "data"
-DATA_FILE = BASE_DIR / "HeatmapData.xlsx"
 
-MASTER_SHEET_NAME = "Sheet1"
-TERMINAL_SHEET_NAME = "Terminal"
+MASTER_CSV_FILE = BASE_DIR / "Sheet1.csv"
+TERMINAL_CSV_FILE = BASE_DIR / "Terminal.csv"
+
+MARKER_LIMIT = 300
 
 
 # =========================================================
@@ -33,24 +34,59 @@ st.title("Pickup / Delivery ZIP Heatmap")
 
 
 # =========================================================
-# Check data file
+# 3. Check data files
 # =========================================================
 
-if not DATA_FILE.exists():
+if not MASTER_CSV_FILE.exists():
     st.error(
-        f"Cannot find data file: {DATA_FILE}. "
-        "Please make sure your Excel file is saved as data/HeatmapData.xlsx."
+        f"Cannot find master CSV file: {MASTER_CSV_FILE}. "
+        "Please make sure it is saved as data/Sheet1.csv."
     )
     st.stop()
 
+if not TERMINAL_CSV_FILE.exists():
+    st.error(
+        f"Cannot find terminal CSV file: {TERMINAL_CSV_FILE}. "
+        "Please make sure it is saved as data/Terminal.csv."
+    )
+    st.stop()
+
+
 # =========================================================
-# 3. Helper functions
+# 4. Helper functions
 # =========================================================
 
+def normalize_column_name(col):
+    """
+    Normalize column names so headers like:
+    P/D Scac, P_D_SCAC, P D SCAC, pdscac
+    can be recognized consistently.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(col).strip().lower())
+
+
+def read_csv_robust(file_path):
+    """
+    Read CSV with a safer encoding fallback.
+    Excel-exported CSV files may use utf-8-sig or latin1/cp1252.
+    """
+    try:
+        return pd.read_csv(
+            file_path,
+            dtype=str,
+            encoding="utf-8-sig",
+            keep_default_na=False
+        )
+    except UnicodeDecodeError:
+        return pd.read_csv(
+            file_path,
+            dtype=str,
+            encoding="latin1",
+            keep_default_na=False
+        )
+
+
 def clean_null_text(value):
-    """
-    Convert Excel NULL / blank values into empty string.
-    """
     if pd.isna(value):
         return ""
 
@@ -91,14 +127,6 @@ def clean_zip(value):
 
 
 def clean_terminal(value):
-    """
-    Clean terminal ID.
-
-    Examples:
-    ' AT ' -> 'AT'
-    'AT.0' -> 'AT'
-    0 / NULL / blank -> None
-    """
     if pd.isna(value):
         return None
 
@@ -136,11 +164,9 @@ def clean_terminal_postal(value):
     if re.match(r"^\d+\.0$", value):
         value = value.split(".")[0]
 
-    # US ZIP
     if re.match(r"^\d{5}", value):
         return value[:5]
 
-    # Canadian postal code
     if re.match(r"^[A-Z]\d[A-Z]\d[A-Z]\d$", value):
         return value
 
@@ -148,9 +174,6 @@ def clean_terminal_postal(value):
 
 
 def get_terminal_country_from_state(state_value):
-    """
-    Decide whether terminal postal code is US or Canada based on State column.
-    """
     state_value = clean_null_text(state_value).upper()
 
     canadian_provinces = {
@@ -165,11 +188,6 @@ def get_terminal_country_from_state(state_value):
 
 
 def get_postal_query_code(postal_code, country):
-    """
-    pgeocode uses:
-    - US ZIP: 5-digit ZIP
-    - Canada: first 3 characters/FSA works better
-    """
     if postal_code is None:
         return None
 
@@ -183,7 +201,7 @@ def get_postal_query_code(postal_code, country):
 
 def standardize_shipment_columns(df):
     """
-    Standardize Sheet1 / master shipment data.
+    Standardize Sheet1.csv / master shipment data.
 
     Expected columns:
     ProNumber | ShipDate | Zip | TotalWeight | Scac | Type | Terminal
@@ -192,20 +210,26 @@ def standardize_shipment_columns(df):
     column_map = {}
 
     for col in df.columns:
-        clean_col = col.strip().lower().replace(" ", "").replace("_", "")
+        clean_col = normalize_column_name(col)
 
-        if clean_col == "pronumber":
+        if clean_col in ["pronumber", "pro", "probill", "probillnumber"]:
             column_map[col] = "ProNumber"
-        elif clean_col == "shipdate":
+
+        elif clean_col in ["shipdate", "date", "pickupdate", "deliverydate"]:
             column_map[col] = "ShipDate"
-        elif clean_col in ["zip", "zipcode", "postalcode"]:
+
+        elif clean_col in ["zip", "zipcode", "postalcode", "shipzip", "conszip"]:
             column_map[col] = "Zip"
-        elif clean_col == "totalweight":
+
+        elif clean_col in ["totalweight", "weight", "totweight"]:
             column_map[col] = "TotalWeight"
-        elif clean_col == "scac":
+
+        elif clean_col in ["scac", "pdscac", "carrier", "carrierscac"]:
             column_map[col] = "Scac"
-        elif clean_col == "type":
+
+        elif clean_col in ["type", "pd", "pickdelivery", "pickupdelivery", "pord"]:
             column_map[col] = "Type"
+
         elif clean_col in [
             "terminal",
             "terminalid",
@@ -230,14 +254,12 @@ def standardize_shipment_columns(df):
     missing_cols = [col for col in required_cols if col not in df.columns]
 
     if missing_cols:
-        st.error(f"Missing required columns in Sheet1: {missing_cols}")
-        st.stop()
+        raise ValueError(
+            f"Missing required columns in Sheet1.csv: {missing_cols}. "
+            f"Current columns are: {list(df.columns)}"
+        )
 
     if "Terminal" not in df.columns:
-        st.warning(
-            "No Terminal column found in Sheet1. "
-            "The app will use UNKNOWN for terminal."
-        )
         df["Terminal"] = "UNKNOWN"
 
     return df
@@ -245,37 +267,45 @@ def standardize_shipment_columns(df):
 
 def standardize_terminal_columns(df):
     """
-    Standardize Terminal tab.
+    Standardize Terminal.csv.
 
-    Your terminal tab structure:
+    Expected columns:
     TerminalId | Address | City | State | Zip
     """
 
     column_map = {}
 
     for col in df.columns:
-        clean_col = col.strip().lower().replace(" ", "").replace("_", "")
+        clean_col = normalize_column_name(col)
 
         if clean_col in ["terminal", "terminalid", "terminalcode", "term"]:
             column_map[col] = "Terminal"
-        elif clean_col == "address":
+
+        elif clean_col in ["address", "terminaladdress"]:
             column_map[col] = "TerminalAddress"
-        elif clean_col == "city":
+
+        elif clean_col in ["city", "terminalcity"]:
             column_map[col] = "TerminalCity"
-        elif clean_col == "state":
+
+        elif clean_col in ["state", "terminalstate"]:
             column_map[col] = "TerminalState"
-        elif clean_col in ["zip", "zipcode", "postalcode"]:
+
+        elif clean_col in ["zip", "zipcode", "postalcode", "terminalzip"]:
             column_map[col] = "TerminalZip"
-        elif clean_col == "latitude":
+
+        elif clean_col in ["latitude", "lat", "terminallatitude"]:
             column_map[col] = "TerminalLatitude"
-        elif clean_col == "longitude":
+
+        elif clean_col in ["longitude", "lon", "lng", "terminallongitude"]:
             column_map[col] = "TerminalLongitude"
 
     df = df.rename(columns=column_map)
 
     if "Terminal" not in df.columns:
-        st.error("Terminal tab must have a TerminalId column.")
-        st.stop()
+        raise ValueError(
+            f"Terminal.csv must have a TerminalId column. "
+            f"Current columns are: {list(df.columns)}"
+        )
 
     if "TerminalAddress" not in df.columns:
         df["TerminalAddress"] = ""
@@ -304,34 +334,209 @@ def standardize_terminal_columns(df):
     df["TerminalLatitude"] = pd.to_numeric(df["TerminalLatitude"], errors="coerce")
     df["TerminalLongitude"] = pd.to_numeric(df["TerminalLongitude"], errors="coerce")
 
-    # Remove bad rows such as TerminalId = 0 / NULL
     df = df[df["Terminal"].notna()].copy()
 
     df["TerminalCountry"] = df["TerminalState"].apply(get_terminal_country_from_state)
 
     df["PostalQuery"] = df.apply(
-        lambda row: get_postal_query_code(row["TerminalZip"], row["TerminalCountry"]),
+        lambda row: get_postal_query_code(
+            row["TerminalZip"],
+            row["TerminalCountry"]
+        ),
         axis=1
     )
 
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_excel_file(file_path, sheet_name):
-    return pd.read_excel(
-        file_path,
-        sheet_name=sheet_name,
-        engine="openpyxl"
+def fill_terminal_coordinates(terminal_df):
+    """
+    Fill missing terminal latitude / longitude using ZIP or postal code.
+    """
+
+    if terminal_df is None or len(terminal_df) == 0:
+        return pd.DataFrame()
+
+    terminal_df = terminal_df.copy()
+
+    missing_lat_lon = (
+        terminal_df["TerminalLatitude"].isna() |
+        terminal_df["TerminalLongitude"].isna()
     )
 
+    need_geo = terminal_df[missing_lat_lon].copy()
+    geo_results = []
 
-@st.cache_data
-def load_zip_coordinates(zip_list):
+    if len(need_geo) > 0:
+
+        postal_pairs = (
+            need_geo[["TerminalCountry", "PostalQuery"]]
+            .dropna()
+            .drop_duplicates()
+        )
+
+        for country in sorted(postal_pairs["TerminalCountry"].unique()):
+
+            query_codes = (
+                postal_pairs.loc[
+                    postal_pairs["TerminalCountry"] == country,
+                    "PostalQuery"
+                ]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+
+            if len(query_codes) == 0:
+                continue
+
+            try:
+                nomi = pgeocode.Nominatim(country.lower())
+                geo = nomi.query_postal_code(query_codes)
+
+                if isinstance(geo, pd.Series):
+                    geo = geo.to_frame().T
+
+                geo = geo[
+                    [
+                        "postal_code",
+                        "latitude",
+                        "longitude"
+                    ]
+                ].copy()
+
+                geo["TerminalCountry"] = country
+
+                geo["PostalQuery"] = geo["postal_code"].astype(str).str.upper()
+                geo["PostalQuery"] = geo["PostalQuery"].str.replace(
+                    " ",
+                    "",
+                    regex=False
+                )
+
+                if country == "CA":
+                    geo["PostalQuery"] = geo["PostalQuery"].str[:3]
+                else:
+                    geo["PostalQuery"] = geo["PostalQuery"].str[:5]
+
+                geo = geo.rename(
+                    columns={
+                        "latitude": "ZipLatitude",
+                        "longitude": "ZipLongitude"
+                    }
+                )
+
+                geo_results.append(
+                    geo[
+                        [
+                            "TerminalCountry",
+                            "PostalQuery",
+                            "ZipLatitude",
+                            "ZipLongitude"
+                        ]
+                    ]
+                )
+
+            except Exception:
+                pass
+
+    if len(geo_results) > 0:
+        geo_lookup = pd.concat(geo_results, ignore_index=True)
+
+        terminal_df = terminal_df.merge(
+            geo_lookup,
+            on=["TerminalCountry", "PostalQuery"],
+            how="left"
+        )
+
+        terminal_df["TerminalLatitude"] = terminal_df["TerminalLatitude"].fillna(
+            terminal_df["ZipLatitude"]
+        )
+
+        terminal_df["TerminalLongitude"] = terminal_df["TerminalLongitude"].fillna(
+            terminal_df["ZipLongitude"]
+        )
+
+        terminal_df = terminal_df.drop(
+            columns=["ZipLatitude", "ZipLongitude"],
+            errors="ignore"
+        )
+
+    return terminal_df
+
+
+@st.cache_data(show_spinner=True)
+def load_and_prepare_data(master_csv_file, terminal_csv_file, master_mtime, terminal_mtime):
+    """
+    Load CSV files, clean data, fill terminal coordinates,
+    and merge terminal information back to master data.
+    """
+
+    master_raw = read_csv_robust(master_csv_file)
+    terminal_raw = read_csv_robust(terminal_csv_file)
+
+    df = standardize_shipment_columns(master_raw)
+
+    df["ProNumber"] = df["ProNumber"].astype(str).str.strip()
+    df["ShipDate"] = pd.to_datetime(df["ShipDate"], errors="coerce")
+    df["Zip"] = df["Zip"].apply(clean_zip)
+    df["TotalWeight"] = pd.to_numeric(df["TotalWeight"], errors="coerce").fillna(0)
+    df["Scac"] = df["Scac"].astype(str).str.strip().str.upper()
+    df["Type"] = df["Type"].astype(str).str.strip().str.upper()
+    df["Terminal"] = df["Terminal"].apply(clean_terminal)
+    df["Terminal"] = df["Terminal"].fillna("UNKNOWN")
+
+    df = df[df["Type"].isin(["P", "D"])].copy()
+    df = df[df["Zip"].notna()].copy()
+
+    terminal_df = standardize_terminal_columns(terminal_raw)
+    terminal_df = fill_terminal_coordinates(terminal_df)
+
+    terminal_lookup = terminal_df[
+        [
+            "Terminal",
+            "TerminalAddress",
+            "TerminalCity",
+            "TerminalState",
+            "TerminalZip",
+            "TerminalCountry",
+            "TerminalLatitude",
+            "TerminalLongitude"
+        ]
+    ].drop_duplicates(subset=["Terminal"]).copy()
+
+    df = df.merge(
+        terminal_lookup,
+        on="Terminal",
+        how="left",
+        indicator=True
+    )
+
+    unmatched_terminals = sorted(
+        df.loc[
+            (df["_merge"] == "left_only") &
+            (df["Terminal"].notna()) &
+            (df["Terminal"] != "UNKNOWN"),
+            "Terminal"
+        ].unique()
+    )
+
+    df = df.drop(columns=["_merge"])
+
+    return df, terminal_df, unmatched_terminals
+
+
+@st.cache_data(show_spinner=False)
+def load_zip_coordinates(zip_tuple):
     """
     Get latitude and longitude for shipment ZIPs.
     Shipment ZIPs are treated as US ZIPs.
     """
+
+    zip_list = list(zip_tuple)
+
+    if len(zip_list) == 0:
+        return pd.DataFrame()
 
     nomi = pgeocode.Nominatim("us")
     geo = nomi.query_postal_code(zip_list)
@@ -361,135 +566,29 @@ def load_zip_coordinates(zip_list):
         }
     )
 
-    geo["Zip"] = geo["Zip"].astype(str).str.zfill(5)
+    geo["Zip"] = geo["Zip"].apply(clean_zip)
+    geo = geo.dropna(subset=["Zip"])
+    geo = geo.drop_duplicates(subset=["Zip"])
 
     return geo
 
 
-def prepare_terminal_marker_data(terminal_df, selected_terminals):
-    """
-    Prepare terminal marker locations.
-
-    If Latitude / Longitude exist in the Terminal tab, use them.
-    Otherwise:
-    - US terminals use 5-digit ZIP centroid
-    - Canadian terminals use first 3-character postal area
-    """
-
+def get_selected_terminal_markers(terminal_df, selected_terminals):
     if terminal_df is None or len(terminal_df) == 0:
         return pd.DataFrame()
 
-    terminal_filtered = terminal_df[
+    terminal_marker_data = terminal_df[
         terminal_df["Terminal"].isin(selected_terminals)
     ].copy()
 
-    if len(terminal_filtered) == 0:
-        return pd.DataFrame()
-
-    missing_lat_lon = (
-        terminal_filtered["TerminalLatitude"].isna() |
-        terminal_filtered["TerminalLongitude"].isna()
+    terminal_marker_data = terminal_marker_data.dropna(
+        subset=["TerminalLatitude", "TerminalLongitude"]
     )
 
-    need_geo = terminal_filtered[missing_lat_lon].copy()
-
-    geo_results = []
-
-    if len(need_geo) > 0:
-
-        postal_pairs = (
-            need_geo[["TerminalCountry", "PostalQuery"]]
-            .dropna()
-            .drop_duplicates()
-        )
-
-        for country in sorted(postal_pairs["TerminalCountry"].unique()):
-
-            country_pairs = postal_pairs[
-                postal_pairs["TerminalCountry"] == country
-            ].copy()
-
-            query_codes = country_pairs["PostalQuery"].dropna().unique().tolist()
-
-            if len(query_codes) == 0:
-                continue
-
-            try:
-                nomi = pgeocode.Nominatim(country.lower())
-                geo = nomi.query_postal_code(query_codes)
-
-                if isinstance(geo, pd.Series):
-                    geo = geo.to_frame().T
-
-                geo = geo[
-                    [
-                        "postal_code",
-                        "latitude",
-                        "longitude"
-                    ]
-                ].copy()
-
-                geo["TerminalCountry"] = country
-
-                geo["PostalQuery"] = geo["postal_code"].astype(str).str.upper()
-                geo["PostalQuery"] = geo["PostalQuery"].str.replace(" ", "", regex=False)
-
-                if country == "CA":
-                    geo["PostalQuery"] = geo["PostalQuery"].str[:3]
-                else:
-                    geo["PostalQuery"] = geo["PostalQuery"].str[:5]
-
-                geo = geo.rename(
-                    columns={
-                        "latitude": "ZipLatitude",
-                        "longitude": "ZipLongitude"
-                    }
-                )
-
-                geo_results.append(
-                    geo[
-                        [
-                            "TerminalCountry",
-                            "PostalQuery",
-                            "ZipLatitude",
-                            "ZipLongitude"
-                        ]
-                    ]
-                )
-
-            except Exception as e:
-                st.warning(f"Could not geocode terminal postal codes for {country}: {e}")
-
-    if len(geo_results) > 0:
-
-        geo_lookup = pd.concat(geo_results, ignore_index=True)
-
-        terminal_filtered = terminal_filtered.merge(
-            geo_lookup,
-            on=["TerminalCountry", "PostalQuery"],
-            how="left"
-        )
-
-        terminal_filtered["TerminalLatitude"] = terminal_filtered["TerminalLatitude"].fillna(
-            terminal_filtered["ZipLatitude"]
-        )
-
-        terminal_filtered["TerminalLongitude"] = terminal_filtered["TerminalLongitude"].fillna(
-            terminal_filtered["ZipLongitude"]
-        )
-
-    terminal_filtered = terminal_filtered.dropna(
-        subset=["TerminalLatitude", "TerminalLongitude"]
-    ).copy()
-
-    return terminal_filtered
+    return terminal_marker_data
 
 
 def add_terminal_markers(map_object, terminal_marker_data):
-    """
-    Add highlighted terminal markers to the map.
-    """
-
     for _, row in terminal_marker_data.iterrows():
 
         popup_text = f"""
@@ -529,11 +628,6 @@ def add_zip_circle_marker(
     max_value,
     lon_offset=0
 ):
-    """
-    Add colored ZIP circle marker.
-    Used in Compare 2 SCAC mode.
-    """
-
     marker_radius = 6
 
     if max_value > 0:
@@ -565,107 +659,29 @@ def add_zip_circle_marker(
 
 
 # =========================================================
-# 4. Find Excel files
+# 5. Load cached CSV data
 # =========================================================
 
-
-selected_file = DATA_FILE
-
-if not selected_file.exists():
-    st.error(
-        f"Cannot find data file: {selected_file}. "
-        "Please make sure your Excel file is saved as data/HeatmapData.xlsx."
+try:
+    df, terminal_df, unmatched_terminals = load_and_prepare_data(
+        str(MASTER_CSV_FILE),
+        str(TERMINAL_CSV_FILE),
+        MASTER_CSV_FILE.stat().st_mtime,
+        TERMINAL_CSV_FILE.stat().st_mtime
     )
-    st.stop()
-
-
-# =========================================================
-# 5. Load fixed sheets: Sheet1 and Terminal
-# =========================================================
-
-try:
-    master_raw = load_excel_file(str(selected_file), MASTER_SHEET_NAME)
 except Exception as e:
-    st.error(f"Could not load sheet '{MASTER_SHEET_NAME}'. Error: {e}")
+    st.error(f"Could not load CSV data files. Error: {e}")
     st.stop()
-
-try:
-    terminal_raw = load_excel_file(str(selected_file), TERMINAL_SHEET_NAME)
-except Exception as e:
-    st.error(f"Could not load sheet '{TERMINAL_SHEET_NAME}'. Error: {e}")
-    st.stop()
-
-
-# =========================================================
-# 6. Clean master data
-# =========================================================
-
-df = standardize_shipment_columns(master_raw)
-
-df["ProNumber"] = df["ProNumber"].astype(str).str.strip()
-df["ShipDate"] = pd.to_datetime(df["ShipDate"], errors="coerce")
-df["Zip"] = df["Zip"].apply(clean_zip)
-df["TotalWeight"] = pd.to_numeric(df["TotalWeight"], errors="coerce").fillna(0)
-df["Scac"] = df["Scac"].astype(str).str.strip().str.upper()
-df["Type"] = df["Type"].astype(str).str.strip().str.upper()
-df["Terminal"] = df["Terminal"].apply(clean_terminal)
-df["Terminal"] = df["Terminal"].fillna("UNKNOWN")
-
-df = df[df["Type"].isin(["P", "D"])].copy()
-df = df[df["Zip"].notna()].copy()
-
-
-# =========================================================
-# 7. Clean terminal tab
-# =========================================================
-
-terminal_df = standardize_terminal_columns(terminal_raw)
-
-
-# =========================================================
-# 8. Match terminal tab back to master data
-# =========================================================
-
-terminal_lookup = terminal_df[
-    [
-        "Terminal",
-        "TerminalAddress",
-        "TerminalCity",
-        "TerminalState",
-        "TerminalZip",
-        "TerminalCountry",
-        "TerminalLatitude",
-        "TerminalLongitude"
-    ]
-].drop_duplicates(subset=["Terminal"]).copy()
-
-df = df.merge(
-    terminal_lookup,
-    on="Terminal",
-    how="left",
-    indicator=True
-)
-
-unmatched_terminals = sorted(
-    df.loc[
-        (df["_merge"] == "left_only") &
-        (df["Terminal"].notna()) &
-        (df["Terminal"] != "UNKNOWN"),
-        "Terminal"
-    ].unique()
-)
 
 if len(unmatched_terminals) > 0:
     st.warning(
-        "These terminal IDs exist in Sheet1 but were not found in the Terminal tab: "
+        "These terminal IDs exist in Sheet1.csv but were not found in Terminal.csv: "
         f"{unmatched_terminals}"
     )
 
-df = df.drop(columns=["_merge"])
-
 
 # =========================================================
-# 9. Sidebar filters
+# 6. Sidebar filters
 # =========================================================
 
 st.sidebar.header("Filters")
@@ -732,7 +748,7 @@ zip_filter_text = st.sidebar.text_input(
 
 
 # =========================================================
-# 10. Base filters
+# 7. Base filters
 # =========================================================
 
 filtered_base = df[
@@ -760,14 +776,14 @@ if zip_filter_text.strip():
         filtered_base["Zip"].isin(selected_zips)
     ].copy()
 
-terminal_marker_data = prepare_terminal_marker_data(
+terminal_marker_data = get_selected_terminal_markers(
     terminal_df=terminal_df,
     selected_terminals=selected_terminals
 )
 
 
 # =========================================================
-# 11A. Normal Heatmap Mode
+# 8A. Normal Heatmap Mode
 # =========================================================
 
 if map_mode == "Normal Heatmap":
@@ -809,7 +825,7 @@ if map_mode == "Normal Heatmap":
         )
     )
 
-    zip_list = sorted(map_summary["Zip"].dropna().unique().tolist())
+    zip_list = tuple(sorted(map_summary["Zip"].dropna().unique().tolist()))
     zip_geo = load_zip_coordinates(zip_list)
 
     map_data = map_summary.merge(
@@ -827,6 +843,10 @@ if map_mode == "Normal Heatmap":
 
     if len(missing_geo) > 0:
         st.warning(f"{len(missing_geo)} ZIP code(s) could not be mapped and were excluded.")
+
+    if len(map_data) == 0:
+        st.warning("No ZIPs with valid latitude and longitude.")
+        st.stop()
 
     st.subheader("Summary")
 
@@ -863,7 +883,12 @@ if map_mode == "Normal Heatmap":
 
     max_value = map_data[map_weight_column].max()
 
-    for _, row in map_data.iterrows():
+    marker_data = map_data.sort_values(
+        map_weight_column,
+        ascending=False
+    ).head(MARKER_LIMIT)
+
+    for _, row in marker_data.iterrows():
 
         marker_radius = 5
 
@@ -896,7 +921,12 @@ if map_mode == "Normal Heatmap":
 
     folium.LayerControl().add_to(m)
 
-    st_folium(m, width=1300, height=700)
+    st_folium(
+        m,
+        width=1300,
+        height=700,
+        returned_objects=[]
+    )
 
     st.subheader("ZIP Summary for Map")
 
@@ -949,7 +979,7 @@ if map_mode == "Normal Heatmap":
 
 
 # =========================================================
-# 11B. Compare 2 SCAC Mode
+# 8B. Compare 2 SCAC Mode
 # =========================================================
 
 else:
@@ -993,7 +1023,7 @@ else:
         )
     )
 
-    zip_list = sorted(compare_summary["Zip"].dropna().unique().tolist())
+    zip_list = tuple(sorted(compare_summary["Zip"].dropna().unique().tolist()))
     zip_geo = load_zip_coordinates(zip_list)
 
     compare_map_data = compare_summary.merge(
@@ -1187,7 +1217,17 @@ else:
             name=f"{scac_b} Heatmap"
         ).add_to(m)
 
-    for _, row in scac_a_data.iterrows():
+    scac_a_marker_data = scac_a_data.sort_values(
+        map_weight_column,
+        ascending=False
+    ).head(MARKER_LIMIT)
+
+    scac_b_marker_data = scac_b_data.sort_values(
+        map_weight_column,
+        ascending=False
+    ).head(MARKER_LIMIT)
+
+    for _, row in scac_a_marker_data.iterrows():
         add_zip_circle_marker(
             map_object=m,
             row=row,
@@ -1198,7 +1238,7 @@ else:
             lon_offset=-0.01
         )
 
-    for _, row in scac_b_data.iterrows():
+    for _, row in scac_b_marker_data.iterrows():
         add_zip_circle_marker(
             map_object=m,
             row=row,
@@ -1214,7 +1254,12 @@ else:
 
     folium.LayerControl().add_to(m)
 
-    st_folium(m, width=1300, height=700)
+    st_folium(
+        m,
+        width=1300,
+        height=700,
+        returned_objects=[]
+    )
 
     st.subheader("SCAC ZIP Comparison Table")
 
