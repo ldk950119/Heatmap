@@ -317,9 +317,13 @@ def standardize_terminal_columns(df):
     return df
 
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_excel_file(file_path, sheet_name):
-    return pd.read_excel(file_path, sheet_name=sheet_name)
+    return pd.read_excel(
+        file_path,
+        sheet_name=sheet_name,
+        engine="openpyxl"
+    )
 
 
 @st.cache_data
@@ -564,22 +568,15 @@ def add_zip_circle_marker(
 # 4. Find Excel files
 # =========================================================
 
-excel_files = sorted(
-    [
-        file for file in BASE_DIR.glob("*.xlsx")
-        if not file.name.startswith("~$")
-    ]
-)
 
-if not excel_files:
-    st.error(f"No Excel file found in this folder: {BASE_DIR}")
+selected_file = DATA_FILE
+
+if not selected_file.exists():
+    st.error(
+        f"Cannot find data file: {selected_file}. "
+        "Please make sure your Excel file is saved as data/HeatmapData.xlsx."
+    )
     st.stop()
-
-selected_file = st.sidebar.selectbox(
-    "Select Excel File",
-    options=excel_files,
-    format_func=lambda x: x.name
-)
 
 
 # =========================================================
