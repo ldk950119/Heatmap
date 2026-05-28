@@ -1,0 +1,7 @@
+streamlit
+pandas
+openpyxl
+folium
+streamlit-folium
+pgeocode
+branca
