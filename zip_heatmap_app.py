@@ -18,7 +18,21 @@ BASE_DIR = Path(__file__).resolve().parent / "data"
 MASTER_CSV_FILE = BASE_DIR / "Sheet1.csv"
 TERMINAL_CSV_FILE = BASE_DIR / "Terminal.csv"
 
-MARKER_LIMIT = 300
+# None = show all ZIP markers.
+# If the map becomes too slow later, change this to 500 or 1000.
+MARKER_LIMIT = None
+
+# Spectrum style used by both the heatmap and ZIP circle fills.
+# Low volume = blue, medium = green/yellow, high = orange/red.
+SPECTRUM_GRADIENT = {
+    0.00: "#313695",  # deep blue
+    0.20: "#4575b4",  # blue
+    0.40: "#74add1",  # light blue
+    0.55: "#1a9850",  # green
+    0.70: "#ffffbf",  # yellow
+    0.85: "#fdae61",  # orange
+    1.00: "#a50026",  # red
+}
 
 
 # =========================================================
@@ -57,19 +71,10 @@ if not TERMINAL_CSV_FILE.exists():
 # =========================================================
 
 def normalize_column_name(col):
-    """
-    Normalize column names so headers like:
-    P/D Scac, P_D_SCAC, P D SCAC, pdscac
-    can be recognized consistently.
-    """
     return re.sub(r"[^a-z0-9]", "", str(col).strip().lower())
 
 
 def read_csv_robust(file_path):
-    """
-    Read CSV with a safer encoding fallback.
-    Excel-exported CSV files may use utf-8-sig or latin1/cp1252.
-    """
     try:
         return pd.read_csv(
             file_path,
@@ -198,6 +203,106 @@ def get_postal_query_code(postal_code, country):
 
     return postal_code[:5]
 
+
+def scaled_radius(value, max_value, min_radius=1.5, max_radius=40):
+    """
+    Used for Total Weight marker size.
+    Square-root scaling keeps medium ZIPs visible.
+    """
+    try:
+        value = float(value)
+        max_value = float(max_value)
+    except Exception:
+        return min_radius
+
+    if max_value <= 0 or value <= 0:
+        return min_radius
+
+    ratio = min(value / max_value, 1)
+
+    return min_radius + (max_radius - min_radius) * (ratio ** 0.5)
+
+
+def zip_marker_radius(value, metric_column, max_value):
+    """
+    Marker size rule:
+    - Shipment Count: starts as a tiny dot and grows every 10 shipments.
+    - Total Weight: uses square-root scaling.
+    """
+    try:
+        value = float(value)
+    except Exception:
+        return 1.5
+
+    if value <= 0:
+        return 1.5
+
+    if metric_column == "ShipmentCount":
+        min_radius = 1.5
+        max_radius = 40
+
+        shipment_step = 10
+        radius_step = 0.35
+
+        steps = int(value // shipment_step)
+
+        return min(min_radius + steps * radius_step, max_radius)
+
+    return scaled_radius(
+        value=value,
+        max_value=max_value,
+        min_radius=1.5,
+        max_radius=40
+    )
+
+def shipment_color(value, max_value):
+    """
+    Return a spectrum color based on selected volume.
+
+    Low value  -> blue
+    Medium     -> green / yellow
+    High value -> orange / red
+    """
+    try:
+        value = float(value)
+        max_value = float(max_value)
+    except Exception:
+        return "#313695"
+
+    if max_value <= 0 or value <= 0:
+        return "#313695"
+
+    ratio = min(max(value / max_value, 0), 1)
+
+    # Convert gradient stops into ordered list.
+    stops = sorted(SPECTRUM_GRADIENT.items())
+
+    for i in range(len(stops) - 1):
+        left_pos, left_color = stops[i]
+        right_pos, right_color = stops[i + 1]
+
+        if left_pos <= ratio <= right_pos:
+            span = right_pos - left_pos
+            local_ratio = 0 if span == 0 else (ratio - left_pos) / span
+
+            def hex_to_rgb(hex_color):
+                hex_color = hex_color.lstrip("#")
+                return tuple(int(hex_color[j:j + 2], 16) for j in (0, 2, 4))
+
+            def rgb_to_hex(rgb):
+                return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+            left_rgb = hex_to_rgb(left_color)
+            right_rgb = hex_to_rgb(right_color)
+
+            mixed_rgb = tuple(
+                int(left_rgb[j] + (right_rgb[j] - left_rgb[j]) * local_ratio)
+                for j in range(3)
+            )
+
+            return rgb_to_hex(mixed_rgb)
+
+    return stops[-1][1]
 
 def standardize_shipment_columns(df):
     """
@@ -618,20 +723,25 @@ def add_terminal_markers(map_object, terminal_marker_data):
             icon=folium.Icon(color="red", icon="home")
         ).add_to(map_object)
 
-
 def add_zip_circle_marker(
     map_object,
     row,
     color,
     scac_name,
     metric_column,
-    max_value,
+    marker_scale_max,
     lon_offset=0
 ):
-    marker_radius = 6
+    marker_radius = zip_marker_radius(
+        value=row[metric_column],
+        metric_column=metric_column,
+        max_value=marker_scale_max
+    )
 
-    if max_value > 0:
-        marker_radius = 6 + 18 * row[metric_column] / max_value
+    marker_color = shipment_color(
+        value=row[metric_column],
+        max_value=marker_scale_max
+    )
 
     popup_text = f"""
     <b>ZIP:</b> {row['Zip']}<br>
@@ -652,8 +762,8 @@ def add_zip_circle_marker(
         tooltip=f"{scac_name} | ZIP {row['Zip']} | {metric_column}: {row[metric_column]:,.0f}",
         color=color,
         fill=True,
-        fill_color=color,
-        fill_opacity=0.65,
+        fill_color=marker_color,
+        fill_opacity=0.75,
         weight=2
     ).add_to(map_object)
 
@@ -748,8 +858,15 @@ zip_filter_text = st.sidebar.text_input(
 
 
 # =========================================================
-# 7. Base filters
+# 7. Base filters and absolute heatmap scale
 # =========================================================
+
+# This scale dataframe controls heatmap intensity.
+# It intentionally does NOT filter by terminal or SCAC.
+# This prevents a low-volume terminal/SCAC from looking artificially dense.
+scale_base = df[
+    df["Type"].isin(selected_types)
+].copy()
 
 filtered_base = df[
     (df["Type"].isin(selected_types)) &
@@ -765,6 +882,11 @@ if selected_date_range and len(selected_date_range) == 2:
         (filtered_base["ShipDate"] < end_date)
     ].copy()
 
+    scale_base = scale_base[
+        (scale_base["ShipDate"] >= start_date) &
+        (scale_base["ShipDate"] < end_date)
+    ].copy()
+
 if zip_filter_text.strip():
     selected_zips = [
         clean_zip(x)
@@ -775,6 +897,27 @@ if zip_filter_text.strip():
     filtered_base = filtered_base[
         filtered_base["Zip"].isin(selected_zips)
     ].copy()
+
+    scale_base = scale_base[
+        scale_base["Zip"].isin(selected_zips)
+    ].copy()
+
+scale_summary = (
+    scale_base
+    .groupby("Zip", as_index=False)
+    .agg(
+        ShipmentCount=("ProNumber", "nunique"),
+        TotalWeight=("TotalWeight", "sum")
+    )
+)
+
+if len(scale_summary) > 0:
+    global_heatmap_max = scale_summary[map_weight_column].max()
+else:
+    global_heatmap_max = 1
+
+if global_heatmap_max <= 0:
+    global_heatmap_max = 1
 
 terminal_marker_data = get_selected_terminal_markers(
     terminal_df=terminal_df,
@@ -848,15 +991,33 @@ if map_mode == "Normal Heatmap":
         st.warning("No ZIPs with valid latitude and longitude.")
         st.stop()
 
+    map_data["HeatmapIntensity"] = map_data[map_weight_column] / global_heatmap_max
+    map_data["HeatmapIntensity"] = map_data["HeatmapIntensity"].clip(lower=0.001, upper=1)
+
+    # Marker size and marker color are scaled within the currently displayed map.
+    # Heatmap intensity still uses the absolute scale above.
+    marker_scale_max = map_data[map_weight_column].max()
+
+    if marker_scale_max <= 0:
+        marker_scale_max = 1
+
+    marker_color_max = marker_scale_max
+
     st.subheader("Summary")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     col1.metric("Total Shipments", int(filtered["ProNumber"].nunique()))
     col2.metric("Total Weight", f"{filtered['TotalWeight'].sum():,.0f}")
     col3.metric("Unique ZIPs", filtered["Zip"].nunique())
     col4.metric("Unique SCACs", filtered["Scac"].nunique())
     col5.metric("Unique Terminals", filtered["Terminal"].nunique())
+    col6.metric("Absolute Scale Max", f"{global_heatmap_max:,.0f}")
+
+    st.caption(
+        "Heatmap intensity uses an absolute scale based on all terminals for the selected Type / Date / ZIP range. "
+        "Circle size is scaled based on the currently displayed ZIPs."
+    )
 
     st.subheader("ZIP Heatmap")
 
@@ -869,31 +1030,40 @@ if map_mode == "Normal Heatmap":
         tiles="CartoDB positron"
     )
 
+    # Density heatmap layer
     heat_data = map_data[
-        ["Latitude", "Longitude", map_weight_column]
+        ["Latitude", "Longitude", "HeatmapIntensity"]
     ].values.tolist()
 
     HeatMap(
         heat_data,
-        radius=22,
-        blur=16,
-        min_opacity=0.35,
-        name="Heatmap"
+        radius=24,
+        blur=18,
+        min_opacity=0.20,
+        gradient=SPECTRUM_GRADIENT,
+        name="Spectrum Shipment Density Heatmap"
     ).add_to(m)
-
-    max_value = map_data[map_weight_column].max()
 
     marker_data = map_data.sort_values(
         map_weight_column,
         ascending=False
-    ).head(MARKER_LIMIT)
+    )
+
+    if MARKER_LIMIT is not None:
+        marker_data = marker_data.head(MARKER_LIMIT)
 
     for _, row in marker_data.iterrows():
 
-        marker_radius = 5
+        marker_radius = zip_marker_radius(
+            value=row[map_weight_column],
+            metric_column=map_weight_column,
+            max_value=marker_scale_max
+        )
 
-        if max_value > 0:
-            marker_radius = 5 + 15 * row[map_weight_column] / max_value
+        marker_color = shipment_color(
+            value=row[map_weight_column],
+            max_value=marker_color_max
+        )
 
         popup_text = f"""
         <b>ZIP:</b> {row['Zip']}<br>
@@ -904,15 +1074,19 @@ if map_mode == "Normal Heatmap":
         <b>Type:</b> {row['TypeList']}<br>
         <b>SCAC:</b> {row['ScacList']}<br>
         <b>Shipment Count:</b> {int(row['ShipmentCount'])}<br>
-        <b>Total Weight:</b> {row['TotalWeight']:,.0f}
+        <b>Total Weight:</b> {row['TotalWeight']:,.0f}<br>
+        <b>Heatmap Intensity:</b> {row['HeatmapIntensity']:.3f}
         """
 
         folium.CircleMarker(
             location=[row["Latitude"], row["Longitude"]],
             radius=marker_radius,
             popup=folium.Popup(popup_text, max_width=300),
+            tooltip=f"ZIP {row['Zip']} | {map_weight_column}: {row[map_weight_column]:,.0f}",
+            color=marker_color,
             fill=True,
-            fill_opacity=0.65,
+            fill_color=marker_color,
+            fill_opacity=0.70,
             weight=1
         ).add_to(m)
 
@@ -941,6 +1115,7 @@ if map_mode == "Normal Heatmap":
             "ScacList",
             "ShipmentCount",
             "TotalWeight",
+            "HeatmapIntensity",
             "Latitude",
             "Longitude"
         ]
@@ -1039,6 +1214,14 @@ else:
     if len(compare_map_data) == 0:
         st.warning("No ZIPs with valid latitude and longitude.")
         st.stop()
+
+    compare_map_data["HeatmapIntensity"] = compare_map_data[map_weight_column] / global_heatmap_max
+    compare_map_data["HeatmapIntensity"] = compare_map_data["HeatmapIntensity"].clip(lower=0.001, upper=1)
+
+    marker_scale_max = compare_map_data[map_weight_column].max()
+
+    if marker_scale_max <= 0:
+        marker_scale_max = 1
 
     count_pivot = compare_summary.pivot_table(
         index="Zip",
@@ -1141,7 +1324,7 @@ else:
     only_a_zip_count = (comparison_table["CoverageStatus"] == f"Only {scac_a}").sum()
     only_b_zip_count = (comparison_table["CoverageStatus"] == f"Only {scac_b}").sum()
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
     col1.metric(f"{scac_a} Shipments", int(a_total_count))
     col2.metric(f"{scac_b} Shipments", int(b_total_count))
@@ -1149,6 +1332,12 @@ else:
     col4.metric(f"Only {scac_a} ZIPs", int(only_a_zip_count))
     col5.metric(f"Only {scac_b} ZIPs", int(only_b_zip_count))
     col6.metric("Selected Terminals", len(selected_terminals))
+    col7.metric("Absolute Scale Max", f"{global_heatmap_max:,.0f}")
+
+    st.caption(
+        "Heatmap intensity uses an absolute scale based on all terminals and all SCACs for the selected Type / Date / ZIP range. "
+        "Circle size is scaled based on the currently displayed ZIPs."
+    )
 
     st.markdown(
         f"""
@@ -1179,53 +1368,47 @@ else:
         compare_map_data["Scac"] == scac_b
     ].copy()
 
-    max_value = compare_map_data[map_weight_column].max()
-
     if len(scac_a_data) > 0:
         heat_a = scac_a_data[
-            ["Latitude", "Longitude", map_weight_column]
+            ["Latitude", "Longitude", "HeatmapIntensity"]
         ].values.tolist()
 
         HeatMap(
             heat_a,
-            radius=22,
-            blur=16,
-            min_opacity=0.35,
-            gradient={
-                0.3: "lightblue",
-                0.6: "blue",
-                1.0: "darkblue"
-            },
-            name=f"{scac_a} Heatmap"
+            radius=24,
+            blur=18,
+            min_opacity=0.20,
+            gradient=SPECTRUM_GRADIENT,
+            name=f"{scac_a} Spectrum Heatmap"
         ).add_to(m)
 
     if len(scac_b_data) > 0:
         heat_b = scac_b_data[
-            ["Latitude", "Longitude", map_weight_column]
+            ["Latitude", "Longitude", "HeatmapIntensity"]
         ].values.tolist()
 
         HeatMap(
             heat_b,
-            radius=22,
-            blur=16,
-            min_opacity=0.35,
-            gradient={
-                0.3: "pink",
-                0.6: "red",
-                1.0: "darkred"
-            },
-            name=f"{scac_b} Heatmap"
+            radius=24,
+            blur=18,
+            min_opacity=0.20,
+            gradient=SPECTRUM_GRADIENT,
+            name=f"{scac_b} Spectrum Heatmap"
         ).add_to(m)
 
     scac_a_marker_data = scac_a_data.sort_values(
         map_weight_column,
         ascending=False
-    ).head(MARKER_LIMIT)
+    )
 
     scac_b_marker_data = scac_b_data.sort_values(
         map_weight_column,
         ascending=False
-    ).head(MARKER_LIMIT)
+    )
+
+    if MARKER_LIMIT is not None:
+        scac_a_marker_data = scac_a_marker_data.head(MARKER_LIMIT)
+        scac_b_marker_data = scac_b_marker_data.head(MARKER_LIMIT)
 
     for _, row in scac_a_marker_data.iterrows():
         add_zip_circle_marker(
@@ -1234,7 +1417,7 @@ else:
             color="blue",
             scac_name=scac_a,
             metric_column=map_weight_column,
-            max_value=max_value,
+            marker_scale_max=marker_scale_max,
             lon_offset=-0.01
         )
 
@@ -1245,7 +1428,7 @@ else:
             color="red",
             scac_name=scac_b,
             metric_column=map_weight_column,
-            max_value=max_value,
+            marker_scale_max=marker_scale_max,
             lon_offset=0.01
         )
 
